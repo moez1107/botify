@@ -1,0 +1,32 @@
+{
+  "compilerOptions": {
+    "outDir": "./dist-tests",
+    "noEmit": false,
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "forceConsistentCasingInFileNames": true,
+    "target": "ES2019",
+    "lib": ["es2019"],
+    "jsx": "react-jsx",
+    "allowJs": false,
+    "isolatedModules": false,
+    "emitDeclarationOnly": false,
+    "declaration": false,
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./*"],
+      "swr": ["./lib/swr"]
+    }
+  },
+  "include": [
+    "tests/**/*.ts",
+    "lib/utils/locked-capital.ts",
+    "lib/validations/**/*.ts",
+    "lib/services/lucky-draw-deposits.ts",
+    "types/**/*.d.ts"
+  ],
+  "exclude": ["node_modules"]
+}
