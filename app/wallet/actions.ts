@@ -1,0 +1,203 @@
+"use server"
+
+import { revalidatePath } from "next/cache"
+import { cookies } from "next/headers"
+
+import { verifyToken } from "@/lib/auth"
+import { submitDeposit, DepositSubmissionError } from "@/lib/services/deposit"
+
+export interface DepositFormState {
+  error?: string | null
+  success?: string | null
+}
+
+export interface WithdrawFormState {
+  error?: string | null
+  success?: string | null
+  balances?: {
+    availableToWithdraw: number
+    pendingWithdraw: number
+    withdrawableBalance?: number
+  }
+}
+
+function isFileLike(value: unknown): value is File {
+  if (!value || typeof value !== "object") return false
+  const candidate = value as Record<string, unknown>
+  return (
+    typeof candidate.arrayBuffer === "function" &&
+    typeof candidate.size === "number" &&
+    typeof candidate.name === "string" &&
+    candidate.name.length > 0
+  )
+}
+
+export async function submitDepositAction(
+  _: DepositFormState,
+  formData: FormData,
+): Promise<DepositFormState> {
+  const cookieStore = await cookies()
+  const token = cookieStore.get("auth-token")?.value
+  if (!token) return { error: "You must be signed in to submit a deposit." }
+
+  const user = verifyToken(token)
+  if (!user) return { error: "Session expired. Please sign in again." }
+
+  const amountRaw = String(formData.get("amount") ?? "").trim()
+  if (!amountRaw) return { error: "Enter a valid deposit amount" }
+
+  const amountPattern = /^\d+(?:\.\d{0,2})?$/
+  if (!amountPattern.test(amountRaw)) {
+    return {
+      error: amountRaw.includes(".")
+        ? "Amount can have at most 2 decimal places."
+        : "Enter a valid deposit amount",
+    }
+  }
+
+  const amountValue = Number.parseFloat(amountRaw)
+  const transactionNumber = String(formData.get("transactionNumber") ?? "").trim()
+  const exchangePlatform = String(formData.get("exchangePlatform") ?? "").trim() || undefined
+  const network = String(formData.get("network") ?? "").trim()
+
+  if (!Number.isFinite(amountValue) || amountValue <= 0) return { error: "Enter a valid deposit amount" }
+  if (amountValue < 30) return { error: "Amount must be at least $30." }
+  if (!network) return { error: "Select a deposit network" }
+
+  const receiptEntry = formData.get("receipt")
+  const receiptFile = isFileLike(receiptEntry) ? receiptEntry : null
+
+  try {
+    const result = await submitDeposit({
+      userId: user.userId,
+      amount: amountValue,
+      transactionNumber,
+      exchangePlatform,
+      network,
+      receiptFile,
+    })
+
+    // ✅ FIX: correct wallet route
+    revalidatePath("/e-wallet")
+
+    return { success: result.message }
+  } catch (error: any) {
+    console.error("Deposit submission failed (raw):", {
+      name: error?.name,
+      message: error?.message,
+      stack: error?.stack,
+      cause: error?.cause,
+    })
+
+    if (error instanceof DepositSubmissionError) {
+      return { error: error.message }
+    }
+
+    // ✅ show real message if available (instead of always "Unable...")
+    const msg = typeof error?.message === "string" && error.message.trim()
+      ? error.message
+      : "Unable to submit deposit. Please try again."
+
+    return { error: msg }
+  }
+}
+
+function resolveInternalUrl(path: string): string {
+  const candidates = [
+    process.env.NEXT_PUBLIC_APP_URL,
+    process.env.NEXTAUTH_URL,
+    process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : undefined,
+  ]
+
+  const sanitizedPath = path.startsWith("/") ? path : `/${path}`
+
+  for (const candidate of candidates) {
+    const value = candidate?.trim()
+    if (!value) continue
+
+    try {
+      const url = new URL(value.startsWith("http") ? value : `https://${value}`)
+      return `${url.origin}${sanitizedPath}`
+    } catch {
+      // Skip invalid values and try the next candidate
+    }
+  }
+
+  return `http://localhost:3000${sanitizedPath}`
+}
+
+export async function submitWithdrawAction(
+  _: WithdrawFormState,
+  formData: FormData,
+): Promise<WithdrawFormState> {
+  const cookieStore = await cookies()
+  const token = cookieStore.get("auth-token")?.value
+  if (!token) return { error: "You must be signed in to submit a withdrawal." }
+
+  const user = verifyToken(token)
+  if (!user) return { error: "Session expired. Please sign in again." }
+
+  const amountValue = Number.parseFloat(String(formData.get("amount") ?? ""))
+  if (!Number.isFinite(amountValue) || amountValue <= 0) {
+    return { error: "Enter a valid withdrawal amount" }
+  }
+
+  const walletAddress = String(formData.get("walletAddress") ?? "").trim()
+  if (!walletAddress) return { error: "Enter or select a wallet address" }
+
+  const cookieHeader = cookieStore
+    .getAll()
+    .map((cookie) => `${cookie.name}=${cookie.value}`)
+    .join("; ")
+
+  try {
+    const response = await fetch(resolveInternalUrl("/api/wallet/withdraw"), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+      },
+      body: JSON.stringify({ amount: amountValue, walletAddress, source: "earnings" }),
+      cache: "no-store",
+    })
+
+    const data = await response.json().catch(() => null)
+
+    if (!response.ok) {
+      const message =
+        data?.error ||
+        (Array.isArray(data?.details) && data.details.length > 0 && data.details[0]?.message) ||
+        "Withdrawal request failed. Please try again."
+      return { error: message }
+    }
+
+    revalidatePath("/e-wallet")
+    revalidatePath("/withdraw")
+
+    const updatedBalances =
+      typeof data?.availableToWithdraw === "number" || typeof data?.pendingWithdraw === "number"
+        ? {
+            availableToWithdraw: Number(data.availableToWithdraw ?? data.withdrawableBalance ?? 0),
+            pendingWithdraw: Number(data.pendingWithdraw ?? 0),
+            withdrawableBalance: Number(data.withdrawableBalance ?? data.availableToWithdraw ?? 0),
+          }
+        : undefined
+
+    return {
+      success: "Withdrawal request submitted successfully.",
+      balances: updatedBalances,
+    }
+  } catch (error: any) {
+    console.error("Withdrawal submission failed (raw):", {
+      name: error?.name,
+      message: error?.message,
+      stack: error?.stack,
+      cause: error?.cause,
+    })
+    const fallbackMessage =
+      typeof error?.message === "string" && error.message.trim()
+        ? error.message
+        : "Unable to submit withdrawal. Please try again."
+    return { error: fallbackMessage }
+  }
+}

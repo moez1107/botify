@@ -1,0 +1,248 @@
+// @ts-nocheck
+import mongoose, { Schema, type Document } from "mongoose"
+
+import { createModelProxy } from "@/lib/in-memory/model-factory"
+
+export interface IUser extends Document {
+  email: string
+  phone?: string
+  passwordHash: string
+  name: string
+  role: "user" | "admin"
+  referralCode: string
+  referredBy?: mongoose.Types.ObjectId
+  status: "active" | "inactive" | "suspended"
+  isActive: boolean
+  isBlocked: boolean
+  blockedAt?: Date | null
+  emailVerified: boolean
+  phoneVerified: boolean
+  depositTotal: number
+  withdrawTotal: number
+  roiEarnedTotal: number
+  level: number
+  levelCached?: number
+  levelEvaluatedAt?: Date | null
+  directActiveCount: number
+  totalActiveDirects: number
+  lastLevelUpAt?: Date | null
+  qualified: boolean
+  qualifiedAt?: Date | null
+  kycStatus: "unverified" | "pending" | "verified" | "rejected"
+  dailyProfitNextEligibleAt?: Date | null
+  dailyProfitLastClaimedAt?: Date | null
+  dailyProfitLastRewardAmount?: number | null
+  groups: {
+    A: mongoose.Types.ObjectId[]
+    B: mongoose.Types.ObjectId[]
+    C: mongoose.Types.ObjectId[]
+    D: mongoose.Types.ObjectId[]
+  }
+  profileAvatar: string
+  lastLoginAt?: Date | null
+  createdAt: Date
+  updatedAt: Date
+}
+
+type LeanReferral = { referredBy?: mongoose.Types.ObjectId | string | null }
+
+async function assertNoReferralCycle(
+  model: mongoose.Model<IUser>,
+  userId: mongoose.Types.ObjectId,
+  sponsorId: mongoose.Types.ObjectId,
+) {
+  if (userId.equals(sponsorId)) {
+    throw new Error("Users cannot refer themselves")
+  }
+
+  const visited = new Set<string>()
+  let current: mongoose.Types.ObjectId | null = sponsorId
+  const self = userId.toString()
+
+  while (current) {
+    const currentStr = current.toString()
+    if (currentStr === self) {
+      throw new Error("Referral relationship would create a cycle")
+    }
+
+    if (visited.has(currentStr)) {
+      break
+    }
+    visited.add(currentStr)
+
+    const ancestor = (await model
+      .findById(current)
+      .select({ referredBy: 1 })
+      .lean()) as LeanReferral | null
+
+    if (!ancestor?.referredBy) {
+      break
+    }
+
+    current = ancestor.referredBy instanceof mongoose.Types.ObjectId
+      ? ancestor.referredBy
+      : mongoose.Types.ObjectId.isValid(ancestor.referredBy)
+        ? new mongoose.Types.ObjectId(String(ancestor.referredBy))
+        : null
+  }
+}
+
+const ADMIN_ALLOWLIST = (process.env.ADMIN_ALLOWLIST ?? "admin@cryptomining.com")
+  .split(",")
+  .map((email) => email.trim().toLowerCase())
+  .filter(Boolean)
+
+function adminOverrideEnabled(doc: any, options?: Record<string, any>) {
+  const opts = options ?? {}
+  return Boolean(doc?.$locals?.allowAdminRole || opts.allowAdminRole || opts.forceAdminRole)
+}
+
+function adminChangeAllowed(email: string | undefined | null, doc: any, options?: Record<string, any>) {
+  const normalizedEmail = (email ?? "").toLowerCase()
+  return adminOverrideEnabled(doc, options) || (normalizedEmail && ADMIN_ALLOWLIST.includes(normalizedEmail))
+}
+
+const UserSchema = new Schema<IUser>(
+  {
+    email: { type: String, required: true, unique: true, lowercase: true },
+    phone: { type: String, unique: true, sparse: true },
+    passwordHash: { type: String, required: true },
+    name: { type: String, required: true },
+    role: { type: String, enum: ["user", "admin"], default: "user" },
+    referralCode: { type: String, required: true, unique: true },
+    referredBy: { type: Schema.Types.ObjectId, ref: "User" },
+    status: {
+      type: String,
+      enum: ["active", "inactive", "suspended"],
+      default: "inactive",
+      index: true,
+    },
+    isActive: { type: Boolean, default: false },
+    isBlocked: { type: Boolean, default: false, index: true },
+    blockedAt: { type: Date, default: null },
+    emailVerified: { type: Boolean, default: false },
+    phoneVerified: { type: Boolean, default: false },
+    depositTotal: { type: Number, default: 0 },
+    withdrawTotal: { type: Number, default: 0 },
+    roiEarnedTotal: { type: Number, default: 0 },
+    level: { type: Number, default: 0 },
+    levelCached: { type: Number, default: 0 },
+    levelEvaluatedAt: { type: Date, default: null },
+    directActiveCount: { type: Number, default: 0 },
+    totalActiveDirects: { type: Number, default: 0 },
+    lastLevelUpAt: { type: Date, default: null },
+    qualified: { type: Boolean, default: false },
+    qualifiedAt: { type: Date, default: null },
+    dailyProfitNextEligibleAt: { type: Date, default: null },
+    dailyProfitLastClaimedAt: { type: Date, default: null },
+    dailyProfitLastRewardAmount: { type: Number, default: 0 },
+    kycStatus: {
+      type: String,
+      enum: ["unverified", "pending", "verified", "rejected"],
+      default: "unverified",
+    },
+    groups: {
+      A: [{ type: Schema.Types.ObjectId, ref: "User" }],
+      B: [{ type: Schema.Types.ObjectId, ref: "User" }],
+      C: [{ type: Schema.Types.ObjectId, ref: "User" }],
+      D: [{ type: Schema.Types.ObjectId, ref: "User" }],
+    },
+    profileAvatar: { type: String, default: "avatar-01" },
+    lastLoginAt: { type: Date, default: null },
+  },
+  {
+    timestamps: true,
+  },
+)
+
+UserSchema.index({ createdAt: -1 })
+UserSchema.index({ status: 1, createdAt: -1 })
+UserSchema.index({ referredBy: 1 })
+
+UserSchema.pre("save", async function () {
+  if (this.isModified("isActive") && !this.isModified("status")) {
+    this.status = this.isActive ? "active" : "inactive"
+  }
+
+  if (this.isModified("status")) {
+    if (this.status === "active") {
+      this.isActive = true
+    } else if (this.status === "inactive") {
+      this.isActive = false
+    }
+  }
+
+  if (this.isModified("referredBy") && this.referredBy) {
+    const model = this.model("User") as mongoose.Model<IUser>
+    const userId = this._id instanceof mongoose.Types.ObjectId ? this._id : new mongoose.Types.ObjectId(String(this._id))
+    const sponsorId =
+      this.referredBy instanceof mongoose.Types.ObjectId
+        ? this.referredBy
+        : new mongoose.Types.ObjectId(String(this.referredBy))
+
+    await assertNoReferralCycle(model, userId, sponsorId)
+  }
+
+  if (this.isModified("role")) {
+    const saveOpts = (this as any).$__?.saveOptions ?? {}
+    if (this.role === "admin" && !adminChangeAllowed(this.email, this, saveOpts)) {
+      throw new Error("Admin role can only be set via an authorized path")
+    }
+
+    if (this.role !== "admin") {
+      this.role = "user"
+    }
+  }
+})
+
+UserSchema.pre("findOneAndUpdate", async function () {
+  const model = (this as any).model as mongoose.Model<IUser>
+  const updateDoc = (this.getUpdate() ?? {}) as Record<string, any>
+  const referredBy =
+    updateDoc.referredBy ??
+    updateDoc.$set?.referredBy ??
+    updateDoc.$setOnInsert?.referredBy
+
+  if (typeof referredBy === "undefined" || !referredBy) {
+    return
+  }
+
+  const existing = await model
+    .findOne(this.getQuery())
+    .select({ _id: 1, email: 1 })
+    .lean<{ _id: mongoose.Types.ObjectId | string; email?: string }>()
+
+  if (!existing?._id) {
+    return
+  }
+
+  const userId = existing._id instanceof mongoose.Types.ObjectId ? existing._id : new mongoose.Types.ObjectId(String(existing._id))
+  const sponsorId =
+    referredBy instanceof mongoose.Types.ObjectId
+      ? referredBy
+      : new mongoose.Types.ObjectId(String(referredBy))
+
+  await assertNoReferralCycle(model, userId, sponsorId)
+
+  const targetRole =
+    updateDoc.role ??
+    updateDoc.$set?.role ??
+    updateDoc.$setOnInsert?.role
+
+  if (targetRole === "admin") {
+    const opts = (this as any).getOptions?.() ?? {}
+    const nextEmail = updateDoc.email ?? updateDoc.$set?.email ?? updateDoc.$setOnInsert?.email ?? existing.email
+    if (!adminChangeAllowed(nextEmail, { $locals: opts }, opts)) {
+      throw new Error("Admin role can only be set via an authorized path")
+    }
+  } else if (typeof targetRole !== "undefined" && targetRole !== "user") {
+    const nextUpdate = { ...updateDoc }
+    if ("role" in nextUpdate) nextUpdate.role = "user"
+    if (nextUpdate.$set?.role) nextUpdate.$set.role = "user"
+    if (nextUpdate.$setOnInsert?.role) nextUpdate.$setOnInsert.role = "user"
+    this.setUpdate(nextUpdate)
+  }
+})
+
+export default createModelProxy<IUser>("User", UserSchema)
+// @ts-nocheck
